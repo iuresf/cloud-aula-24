@@ -1,0 +1,3 @@
+{"evento_id": "E1", "sessao": "S1", "evento": "view", "pedido_id": null, "dia": "2026-10-20", "canal": "site"}
+{"evento_id": "E2", "sessao": "S1", "evento": "checkout", "pedido_id": "P1042", "dia": "2026-10-20", "canal": "site"}
+{"evento_id": "E3", "sessao": "S2", "evento": "view", "pedido_id": null, "dia": "2026-10-20", "canal": "site"}

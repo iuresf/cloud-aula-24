@@ -1,0 +1,32 @@
+[
+  {
+    "etapa": "inicial",
+    "data": "2026-10-20",
+    "canal": "site",
+    "receita": "129.90",
+    "pagos": 1,
+    "cancelados": 1,
+    "sessoes": 2,
+    "conversao": 0.5
+  },
+  {
+    "etapa": "delta",
+    "data": "2026-10-20",
+    "canal": "site",
+    "receita": "0.00",
+    "pagos": 0,
+    "cancelados": 1,
+    "sessoes": 2,
+    "conversao": 0.0
+  },
+  {
+    "etapa": "reenvio",
+    "data": "2026-10-20",
+    "canal": "site",
+    "receita": "0.00",
+    "pagos": 0,
+    "cancelados": 1,
+    "sessoes": 2,
+    "conversao": 0.0
+  }
+]
