@@ -66,6 +66,27 @@ Resultados esperados no `verify`:
 | initial | 129.90 | 1 | 1 | 2 | 50.0% |
 | delta | 0.00 | 0 | 1 | 2 | 0.0% |
 
+## 4.1 Acompanhar cada envio pelo painel AWS
+
+Use sempre a mesma regiao definida em `terraform.tfvars` (normalmente `us-east-1`). A sequencia abaixo vale tanto para `initial` quanto para `delta`.
+
+1. **Workflow e ordem Silver → Gold:** abra **AWS Glue** → **ETL** → **Workflows** → `a24-lake-workflow`. Na coluna *Last run status*, acompanhe `RUNNING`, `COMPLETED` ou `ERROR`. Selecione o workflow, abra **History**, escolha a execucao mais recente e clique em **View run details**. O grafo deve mostrar Silver concluindo antes de Gold iniciar.
+
+2. **Detalhes dos jobs:** no Glue, abra **ETL jobs** → **Job run monitoring**. Filtre por `a24-lake-silver` ou `a24-lake-gold`. O status esperado e `SUCCEEDED`. Selecione a execucao e clique em **View run details** para ver horario, consumo e o *Job run ID*. Em falha, use **View CloudWatch logs** para abrir os logs do Spark.
+
+3. **Arquivos recebidos e saidas:** abra **Amazon S3** e procure os buckets exibidos por `terraform output`. Na Bronze, confira `pedidos/`, `pagamentos/` e `eventos/`; apos o delta, havera tambem `pagamentos/lote_002.jsonl`. No bucket Results, abra `manifestos/bronze/` para os arquivos de rastreabilidade e `manifestos/silver-ultima-execucao/` e `manifestos/gold-ultima-execucao/` para o registro das etapas. As saidas Parquet ficam nos buckets Silver e Gold.
+
+4. **Resultado analitico:** abra **Amazon Athena** → **Query editor**. No seletor superior direito, escolha o workgroup `a24-lake`; em *Database*, selecione `a24_lake`. Execute:
+
+```sql
+SELECT data, canal, receita, pagos, cancelados, sessoes,
+       ROUND(100 * conversao, 1) AS conversao_pct
+FROM indicadores
+ORDER BY data, canal;
+```
+
+O resultado aparece no painel inferior. Antes do delta, espere receita `129.90` e conversao `50.0`; depois do delta, `0.00` e `0.0`. Em **Recent queries**, voce pode abrir o *Query execution ID* de cada consulta, verificar se terminou em `SUCCEEDED` e baixar o CSV se necessario.
+
 Para inspeção adicional, use os nomes retornados por `terraform output`:
 
 ```bash
