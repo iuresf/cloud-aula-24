@@ -1,0 +1,11 @@
+variable "project" { type = string }
+variable "region" { type = string }
+variable "account_id" { type = string }
+variable "execution_role_arn" { type = string }
+variable "bronze_bucket" { type = string }
+variable "results_bucket" { type = string }
+variable "workflow_name" { type = string }
+variable "workflow_trigger_name" { type = string }
+variable "database_name" { type = string }
+variable "workgroup_name" { type = string }
+variable "enable_cognito_auth" { type = bool }

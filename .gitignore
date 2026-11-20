@@ -6,3 +6,5 @@ infra.json
 evidencias/
 __pycache__/
 .venv/
+diagramas/
+**/.build/

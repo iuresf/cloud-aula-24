@@ -1,3 +1,5 @@
 region = "us-east-1"
 project = "a24-lake"
-glue_role_arn = "arn:aws:iam::123456789012:role/LabRole"
+glue_role_arn = "arn:aws:iam::SUA_CONTA:role/LabRole"
+enable_cognito_auth = true
+# alert_email = "voce@exemplo.com" # confirme a inscricao enviada pelo SNS

@@ -1,307 +1,142 @@
 terraform {
   required_version = ">= 1.5, < 2.0"
   required_providers {
-    # O provider 6 consulta Object Lock ao ler buckets; o SCP do AWS Academy
-    # nega essa API. A linha 5.x e compativel com os recursos deste laboratorio.
-    aws = { source = "hashicorp/aws", version = "= 5.44.0" }
+    aws     = { source = "hashicorp/aws", version = "= 5.44.0" }
+    archive = { source = "hashicorp/archive", version = "~> 2.5" }
   }
 }
-provider "aws" { region = var.region }
-variable "region" {
-  type    = string
-  default = "us-east-1"
-}
-variable "project" {
-  type    = string
-  default = "a24-lake"
-  validation {
-    condition     = can(regex("^[a-z][a-z0-9-]{2,25}$", var.project))
-    error_message = "Use 3 a 26 caracteres minusculos, numeros ou hifen."
+
+provider "aws" {
+  region = var.region
+
+  default_tags {
+    tags = {
+      Project            = var.project
+      Environment        = var.environment
+      DataClassification = var.data_classification
+      ManagedBy          = "Terraform"
+      Architecture       = "data-lake"
+    }
   }
 }
+
 data "aws_caller_identity" "current" {}
-locals { db = replace(var.project, "-", "_") }
+
 locals {
+  database_name = replace(var.project, "-", "_")
   bucket_names = {
     for zone in ["bronze", "silver", "gold", "results"] :
     zone => "${var.project}-${zone}-${data.aws_caller_identity.current.account_id}-${var.region}"
   }
 }
 
-# A SCP do AWS Academy nega s3:GetBucketObjectLockConfiguration. O resource
-# aws_s3_bucket sempre le essa configuracao; estes comandos evitam a leitura
-# negada e ainda tornam o apply/destroy idempotente para este laboratorio.
-resource "terraform_data" "zones" {
-  for_each = local.bucket_names
+module "storage" {
+  source             = "./modules/storage"
+  bucket_names       = local.bucket_names
+  region             = var.region
+  manage_script_path = "${path.module}/scripts/manage_bucket.sh"
+}
+
+module "catalog" {
+  source              = "./modules/catalog"
+  database_name       = local.database_name
+  bucket_names        = module.storage.bucket_names
+  data_classification = var.data_classification
+}
+
+module "athena" {
+  source         = "./modules/athena"
+  project        = var.project
+  results_bucket = module.storage.bucket_names["results"]
+
+  depends_on = [module.storage]
+}
+
+module "etl" {
+  source        = "./modules/etl"
+  project       = var.project
+  glue_role_arn = var.glue_role_arn
+  account_id    = data.aws_caller_identity.current.account_id
+  database_name = module.catalog.database_name
+  bucket_names  = module.storage.bucket_names
+  script_sources = {
+    silver = "${path.module}/jobs/silver.py"
+    gold   = "${path.module}/jobs/gold.py"
+  }
+
+  depends_on = [module.storage, module.catalog]
+}
+
+# Entrada de producao: API autenticada -> SQS/DLQ -> Lambda -> Bronze.
+# A LabRole e reutilizada; este projeto nao cria roles ou politicas IAM.
+module "ingress" {
+  source                = "./modules/ingress"
+  project               = var.project
+  region                = var.region
+  account_id            = data.aws_caller_identity.current.account_id
+  execution_role_arn    = var.glue_role_arn
+  bronze_bucket         = module.storage.bucket_names["bronze"]
+  results_bucket        = module.storage.bucket_names["results"]
+  workflow_name         = module.etl.workflow_name
+  workflow_trigger_name = module.etl.triggers.start_silver
+  database_name         = module.catalog.database_name
+  workgroup_name        = module.athena.workgroup_name
+  enable_cognito_auth   = var.enable_cognito_auth
+
+  depends_on = [module.storage, module.catalog, module.athena, module.etl]
+}
+
+module "observability" {
+  source       = "./modules/observability"
+  project      = var.project
+  alert_email  = var.alert_email
+  job_names    = values(module.etl.job_names)
+  queue_name   = module.ingress.queue_name
+  dlq_name     = module.ingress.dlq_name
+  lambda_names = module.ingress.lambda_names
+
+  depends_on = [module.etl, module.ingress]
+}
+
+# Recriado quando a configuracao que alimenta o inventario ou seu renderizador muda.
+resource "terraform_data" "render_resource_diagram" {
+  triggers_replace = [
+    filesha256("${path.module}/scripts/render_resources_png.py"),
+    sha256(jsonencode({
+      project   = var.project
+      database  = module.catalog.database_name
+      workgroup = module.athena.workgroup_name
+      workflow  = module.etl.workflow_name
+    })),
+  ]
+
   input = {
-    bucket      = each.value
-    region      = var.region
-    script_path = "${path.module}/scripts/manage_bucket.sh"
+    output_path = "${path.module}/diagramas/terraform-recursos.png"
+    project     = var.project
+    database    = module.catalog.database_name
+    workgroup   = module.athena.workgroup_name
+    workflow    = module.etl.workflow_name
   }
 
+  depends_on = [module.storage, module.catalog, module.athena, module.etl, module.ingress, module.observability]
+
   provisioner "local-exec" {
-    command = "bash ${self.input.script_path} create ${self.input.bucket} ${self.input.region}"
-  }
-  provisioner "local-exec" {
-    when    = destroy
-    command = "bash ${self.input.script_path} destroy ${self.input.bucket} ${self.input.region}"
+    command = "python3 '${path.module}/scripts/render_resources_png.py' --output '${self.input.output_path}' --project '${self.input.project}' --database '${self.input.database}' --workgroup '${self.input.workgroup}' --workflow '${self.input.workflow}'"
   }
 }
-resource "aws_glue_catalog_database" "db" { name = local.db }
-resource "aws_athena_workgroup" "lab" {
-  name          = var.project
-  force_destroy = true
-  depends_on    = [terraform_data.zones]
-  configuration {
-    enforce_workgroup_configuration = true
-    bytes_scanned_cutoff_per_query  = 104857600
-    engine_version { selected_engine_version = "Athena engine version 3" }
-    result_configuration {
-      output_location = "s3://${local.bucket_names["results"]}/athena/"
-      encryption_configuration { encryption_option = "SSE_S3" }
-    }
-  }
-}
+
 output "region" { value = var.region }
-output "database" { value = aws_glue_catalog_database.db.name }
-output "workgroup" { value = aws_athena_workgroup.lab.name }
-output "buckets" { value = local.bucket_names }
-
-variable "glue_role_arn" {
-  type        = string
-  description = "ARN exato de role existente autorizada ao Glue. Nao cria IAM."
-  validation {
-    condition     = can(regex("^arn:aws:iam::[0-9]{12}:role/", var.glue_role_arn))
-    error_message = "Informe o ARN de uma role existente, por exemplo a LabRole, se autorizada."
-  }
-}
-resource "aws_s3_object" "scripts" {
-  for_each   = toset(["silver.py", "gold.py"])
-  depends_on = [terraform_data.zones]
-  bucket     = local.bucket_names["results"]
-  key        = "scripts/${each.value}"
-  source     = "${path.module}/jobs/${each.value}"
-  etag       = filemd5("${path.module}/jobs/${each.value}")
-}
-resource "aws_glue_job" "etl" {
-  for_each          = toset(["silver", "gold"])
-  name              = "${var.project}-${each.key}"
-  role_arn          = var.glue_role_arn
-  glue_version      = "5.0"
-  worker_type       = "G.1X"
-  number_of_workers = 2
-  timeout           = 10
-  max_retries       = 0
-  execution_property { max_concurrent_runs = 1 }
-  command {
-    name            = "glueetl"
-    script_location = "s3://${aws_s3_object.scripts["${each.key}.py"].bucket}/${aws_s3_object.scripts["${each.key}.py"].key}"
-    python_version  = "3"
-  }
-  default_arguments = {
-    "--job-language"                     = "python"
-    "--job-bookmark-option"              = "job-bookmark-disable"
-    "--enable-continuous-cloudwatch-log" = "true"
-    "--enable-metrics"                   = "true"
-    "--BRONZE"                           = local.bucket_names["bronze"]
-    "--SILVER"                           = local.bucket_names["silver"]
-    "--GOLD"                             = local.bucket_names["gold"]
-    "--RESULTS"                          = local.bucket_names["results"]
-    "--DATABASE"                         = aws_glue_catalog_database.db.name
-
-  }
-}
-output "jobs" { value = { for k, v in aws_glue_job.etl : k => v.name } }
-
-# O Workflow e seus triggers fazem a orquestracao: Gold so inicia depois do
-# sucesso de Silver. Nenhuma role ou politica IAM e criada pelo projeto.
-resource "aws_glue_workflow" "etl" {
-  name = "${var.project}-workflow"
-  default_run_properties = {
-    project = var.project
-    modelo  = "bronze-silver-gold"
-  }
-}
-
-resource "aws_glue_trigger" "start_silver" {
-  name          = "${var.project}-start-silver"
-  type          = "ON_DEMAND"
-  workflow_name = aws_glue_workflow.etl.name
-
-  actions {
-    job_name = aws_glue_job.etl["silver"].name
-  }
-}
-
-resource "aws_glue_trigger" "silver_succeeded_starts_gold" {
-  name          = "${var.project}-silver-succeeded-gold"
-  type          = "CONDITIONAL"
-  workflow_name = aws_glue_workflow.etl.name
-
-  predicate {
-    conditions {
-      job_name         = aws_glue_job.etl["silver"].name
-      state            = "SUCCEEDED"
-      logical_operator = "EQUALS"
-    }
-  }
-
-  actions {
-    job_name = aws_glue_job.etl["gold"].name
-  }
-}
-
-output "workflow" { value = aws_glue_workflow.etl.name }
-output "triggers" {
-  value = {
-    start_silver = aws_glue_trigger.start_silver.name
-  }
-}
-
-resource "aws_glue_catalog_table" "pedidos" {
-  name          = "pedidos"
-  database_name = aws_glue_catalog_database.db.name
-  table_type    = "EXTERNAL_TABLE"
-  parameters    = { EXTERNAL = "TRUE", classification = "parquet" }
-  storage_descriptor {
-    location      = "s3://${local.bucket_names["silver"]}/pedidos/"
-    input_format  = "org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat"
-    output_format = "org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat"
-    ser_de_info {
-      serialization_library = "org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe"
-      parameters            = { "field.delim" = ",", "serialization.format" = "," }
-    }
-    columns {
-      name = "pedido_id"
-      type = "string"
-    }
-    columns {
-      name = "data"
-      type = "date"
-    }
-    columns {
-      name = "valor"
-      type = "decimal(12,2)"
-    }
-    columns {
-      name = "status"
-      type = "string"
-    }
-    columns {
-      name = "canal"
-      type = "string"
-    }
-  }
-}
-
-resource "aws_glue_catalog_table" "pagamentos" {
-  name          = "pagamentos"
-  database_name = aws_glue_catalog_database.db.name
-  table_type    = "EXTERNAL_TABLE"
-  parameters    = { EXTERNAL = "TRUE", classification = "parquet" }
-  storage_descriptor {
-    location      = "s3://${local.bucket_names["silver"]}/pagamentos/"
-    input_format  = "org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat"
-    output_format = "org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat"
-    ser_de_info {
-      serialization_library = "org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe"
-      parameters            = { "field.delim" = ",", "serialization.format" = "," }
-    }
-    columns {
-      name = "pedido_id"
-      type = "string"
-    }
-    columns {
-      name = "resultado"
-      type = "string"
-    }
-    columns {
-      name = "atualizado_em"
-      type = "timestamp"
-    }
-  }
-}
-
-resource "aws_glue_catalog_table" "eventos" {
-  name          = "eventos"
-  database_name = aws_glue_catalog_database.db.name
-  table_type    = "EXTERNAL_TABLE"
-  parameters    = { EXTERNAL = "TRUE", classification = "parquet" }
-  storage_descriptor {
-    location      = "s3://${local.bucket_names["silver"]}/eventos/"
-    input_format  = "org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat"
-    output_format = "org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat"
-    ser_de_info {
-      serialization_library = "org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe"
-      parameters            = { "field.delim" = ",", "serialization.format" = "," }
-    }
-    columns {
-      name = "evento_id"
-      type = "string"
-    }
-    columns {
-      name = "sessao"
-      type = "string"
-    }
-    columns {
-      name = "evento"
-      type = "string"
-    }
-    columns {
-      name = "pedido_id"
-      type = "string"
-    }
-    columns {
-      name = "data"
-      type = "date"
-    }
-    columns {
-      name = "canal"
-      type = "string"
-    }
-  }
-}
-
-resource "aws_glue_catalog_table" "indicadores" {
-  name          = "indicadores"
-  database_name = aws_glue_catalog_database.db.name
-  table_type    = "EXTERNAL_TABLE"
-  parameters    = { EXTERNAL = "TRUE", classification = "parquet" }
-  storage_descriptor {
-    location      = "s3://${local.bucket_names["gold"]}/indicadores/"
-    input_format  = "org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat"
-    output_format = "org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat"
-    ser_de_info {
-      serialization_library = "org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe"
-      parameters            = { "field.delim" = ",", "serialization.format" = "," }
-    }
-    columns {
-      name = "data"
-      type = "date"
-    }
-    columns {
-      name = "canal"
-      type = "string"
-    }
-    columns {
-      name = "receita"
-      type = "decimal(14,2)"
-    }
-    columns {
-      name = "pagos"
-      type = "bigint"
-    }
-    columns {
-      name = "cancelados"
-      type = "bigint"
-    }
-    columns {
-      name = "sessoes"
-      type = "bigint"
-    }
-    columns {
-      name = "conversao"
-      type = "double"
-    }
-  }
-}
+output "database" { value = module.catalog.database_name }
+output "workgroup" { value = module.athena.workgroup_name }
+output "buckets" { value = module.storage.bucket_names }
+output "jobs" { value = module.etl.job_names }
+output "workflow" { value = module.etl.workflow_name }
+output "triggers" { value = module.etl.triggers }
+output "resource_diagram" { value = "${path.module}/diagramas/terraform-recursos.png" }
+output "ingestion_api_url" { value = module.ingress.ingestion_url }
+output "results_api_url" { value = module.ingress.results_url }
+output "lineage_api_url" { value = module.ingress.lineage_url }
+output "cognito" { value = module.ingress.cognito }
+output "queues" { value = module.ingress.queues }
+output "alerts" { value = module.observability.alerts }
+output "dashboard_url" { value = module.observability.dashboard_url }

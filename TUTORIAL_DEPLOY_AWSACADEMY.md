@@ -21,7 +21,7 @@ python3 -m venv .venv
 cp 02_data_lake/terraform.tfvars.example.txt 02_data_lake/terraform.tfvars
 ```
 
-Edite `02_data_lake/terraform.tfvars`; mantenha uma regiao disponivel no Lab e substitua a conta do exemplo pelo ARN retornado no passo anterior:
+Edite `02_data_lake/terraform.tfvars`; mantenha uma regiao disponivel no Lab e substitua `SUA_CONTA` pelo ARN retornado no passo anterior. A conta no ARN deve ser a mesma exibida por `aws sts get-caller-identity`; usar o ARN de outra conta causa `Cross-account pass role is not allowed`:
 
 ```hcl
 region        = "us-east-1"
@@ -44,7 +44,45 @@ terraform output
 cd ..
 ```
 
-O apply cria quatro buckets, catalogo e tabelas Glue, workgroup Athena, jobs `silver` e `gold`, e o Workflow com dois triggers: `ON_DEMAND` para Silver e condicional (`Silver = SUCCEEDED`) para Gold.
+O apply cria quatro buckets, catalogo e tabelas Glue, workgroup Athena, jobs `silver` e `gold`, e o Workflow com dois triggers: `ON_DEMAND` para Silver e condicional (`Silver = SUCCEEDED`) para Gold. Tambem cria a entrada mais proxima de producao: Cognito, API Gateway, Lambdas, SQS, DLQ, DynamoDB de idempotencia, EventBridge, SNS e dashboard CloudWatch.
+
+Ao terminar, ele tambem gera localmente o diagrama atualizado da infraestrutura. Consulte o caminho exibido por `terraform output resource_diagram` (por padrao, `02_data_lake/diagramas/terraform-recursos.png`). Para abri-lo no Linux:
+
+```bash
+xdg-open diagramas/terraform-recursos.png
+```
+
+Esse PNG e apenas uma evidencia local do `apply`: nao cria recurso adicional na AWS e nao exige Graphviz, Docker ou pacote Python extra.
+
+### 3.1 Confirmar permissao da LabRole
+
+O Terraform nao cria IAM. A role escolhida deve poder ser assumida por Glue e Lambda, e a identidade do Lab deve poder fazer `iam:PassRole`. Para a versao completa, ela tambem necessita permissao para S3, Glue, Athena, Lambda, API Gateway, SQS, DynamoDB, SNS, EventBridge e CloudWatch Logs. Se o Academy bloquear algum desses servicos por SCP, o `apply` deve ser interrompido e o erro guardado como evidencia; nao crie uma role ou politica fora das regras do Lab.
+
+### 3.2 Configurar alerta de falhas
+
+Antes do `plan`, opcionalmente acrescente seu e-mail em `terraform.tfvars`:
+
+```hcl
+alert_email = "seu-email@exemplo.com"
+```
+
+Depois do apply, confirme a mensagem enviada pelo SNS. O EventBridge publica no topico quando os jobs Glue Silver ou Gold terminarem em `FAILED`, `STOPPED` ou `TIMEOUT`. O mesmo topico recebe um alarme quando a DLQ tiver ao menos uma mensagem, isto e, quando a ingestao falhar tres vezes.
+
+### 3.3 Usar a API e verificar o painel
+
+Os outputs mostram os endpoints e o dashboard:
+
+```bash
+terraform output ingestion_api_url
+terraform output results_api_url
+terraform output dashboard_url
+```
+
+`POST /ingestions` recebe JSON com `event_id` (UUID opcional), `key` e `content_base64`. A chave deve iniciar com `pedidos/`, `pagamentos/` ou `eventos/`. A resposta `202` significa que o lote entrou na fila; a Lambda consumidora o grava na Bronze e solicita a execucao do Glue Workflow.
+
+`GET /results` retorna os indicadores Gold em JSON. Para acompanhar a operacao, abra o link de `dashboard_url`: o primeiro grafico mostra a fila e a DLQ; o segundo mostra falhas dos jobs. Uma mensagem que falhar tres vezes vai para a DLQ e precisa ser analisada antes de reenvio.
+
+Com Cognito habilitado (padrao), as duas rotas exigem `Authorization: Bearer <JWT>`. O Cognito criado pelo Terraform e exibido no output `cognito`. Para isolar problema de autorizacao no Lab, e apenas nele, use `enable_cognito_auth = false` e reaplique.
 
 No AWS Academy, a SCP pode bloquear `s3:GetBucketObjectLockConfiguration`. Por isso os buckets deste projeto sao criados pelo script AWS CLI chamado pelo Terraform; ele aplica bloqueio de acesso publico, SSE-S3 e versionamento na Bronze sem chamar a API bloqueada. Nao troque esse mecanismo por `aws_s3_bucket` sem antes testar a politica da conta.
 

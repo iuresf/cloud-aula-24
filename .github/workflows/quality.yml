@@ -1,0 +1,29 @@
+name: quality
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Validar contratos de dados
+        run: python 02_data_lake/scripts/validate_contracts.py
+      - name: Validar codigos Python
+        run: python -m py_compile runner.py 02_data_lake/jobs/*.py 02_data_lake/scripts/*.py 02_data_lake/modules/ingress/files/*.py
+      - name: Formatar e validar Terraform
+        working-directory: 02_data_lake
+        run: |
+          terraform fmt -check -recursive
+          terraform init -backend=false
+          terraform validate
